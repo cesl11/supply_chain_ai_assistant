@@ -1,0 +1,479 @@
+"""This MCP Server define the tools and resources that can be used for the Analyzer agent.
+
+Agent can use this tools and resources to extract helful insights of the data, allowing the LLM to
+execute in-depht data analysis safely, using the new information to generate performance/KPI reports 
+or answer specific questions related to the available information."""
+
+# //// LIBRARIES REQUIRED //// #
+from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+from typing import Literal
+import matplotlib.pyplot as plt
+import pandas as pd
+import docker
+import tempfile
+import pickle
+import json
+import os
+
+# //// SERVER INITALIZATION //// #
+MCPserver = FastMCP(
+    name='AI Agent - Supply Chain Assistant - Analysis Tools'
+)
+
+# //// GLOBAL VARIABLES //// #
+load_dotenv()
+FILEPATH_TO_DATA = os.getenv('FILEPATH_TO_DATA')
+DF = pd.read_csv(FILEPATH_TO_DATA, encoding='utf-8')
+SANDBOX_IMAGE_TAG = "python-data-sandbox:1.0"
+
+
+# //// AUXILIAR FUNCTIONS //// #
+# Auxiliar functions, core of the Tools exposed to LLM  
+def get_or_build_sandbox_image(client:docker.DockerClient) -> str:
+    """
+    Checks if the sandbox Docker image exists and builds it if it's missing.
+    
+    This function is designed to run only once. On subsequent executions, it will
+    find the existing image and return its tag immediately, saving significant time.
+
+    Args:
+        client (docker.DockerClient): The Docker client instance.
+
+    Returns:
+        str: The tag of the sandbox Docker image.
+    """
+    try:
+        # Check if the image already exists locally
+        client.images.get(SANDBOX_IMAGE_TAG)
+        print(f"Found existing image: {SANDBOX_IMAGE_TAG}")
+    except docker.errors.ImageNotFound:
+        print(f"Image not found. Building new image: {SANDBOX_IMAGE_TAG}")
+        # Dockerfile content to define the sandboxed environment
+        dockerfile_content = '''
+FROM python:3.9-slim
+
+# Install only the necessary and allowed data science libraries
+RUN pip install --no-cache-dir numpy pandas matplotlib seaborn scikit-learn scipy
+
+# For security, create a dedicated non-root user to run the code
+RUN useradd -m -u 1000 sandboxuser
+
+# Set the working directory and switch to the non-root user
+WORKDIR /app
+USER sandboxuser
+
+# Set a default command (can be overridden)
+CMD ["python", "/app/user_script.py"]
+'''
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dockerfile_path = os.path.join(temp_dir, 'Dockerfile')
+            with open(dockerfile_path, 'w') as f:
+                f.write(dockerfile_content)
+            
+            # Build the Docker image and tag it for reuse
+            client.images.build(
+                path=temp_dir,
+                tag=SANDBOX_IMAGE_TAG,
+                rm=True,
+                forcerm=True
+            )
+    return SANDBOX_IMAGE_TAG
+
+
+# //// MCP TOOLS //// #
+@MCPserver.tool(
+    name='execute_python_code',
+    title='run_code_in_safe_enviroment'
+)
+def execute_python_code(code_to_run: str) -> str:
+    """
+    Run Python code in a secure, isolated environment for data analysis and calculations.
+
+    This tool is ideal for performing a wide range of Python programming tasks, such as complex mathematical calculations, data manipulation with pandas, and generating visualizations with matplotlib/seaborn. The code runs inside a secure Docker container, without network or file system access, ensuring safe execution.
+
+    ## Pre-Loaded Context
+    The runtime environment comes with a predefined context to facilitate data analysis tasks:
+    - A pandas DataFrame named `df` is already loaded and available for immediate use in your code.
+    - The following libraries are pre-imported and ready to use:
+    - `import pandas as pd`
+    - `import numpy as np`
+    - `import matplotlib.pyplot as plt`
+    - `import seaborn as sns`
+    - `import * from sklearn`
+    - `import scipy`
+
+    ---
+    ## How to Generate Charts and Visualizations
+    To create a chart, use `matplotlib.pyplot` or `seaborn` as you normally would.
+    **Important**: For the visualization to be captured and returned, **you must call `plt.show()`** at the end of your plotting code. The tool will not display an interactive chart, but will return it as a Base64-encoded PNG image within the text output.
+
+    ---
+    ## Output and Results
+    The tool is flexible in how it returns results:
+    - **Standard output (`print`)**: Anything printed using the `print()` function will be captured and returned.
+    - **Last expression**: If the last line of code is an expression (e.g., `df.head()` or `1 + 1`), its result will be returned automatically.
+    - **Charts**: Generated visualizations are added to the output as Base64 strings.
+
+    ---
+    ## Restrictions and Security
+    To ensure security, the runtime environment has the following limitations:
+    - **No internet access**: The code cannot make network requests (e.g., to APIs or websites).
+    - **No file system access**: Files cannot be read or written to disk.
+    - **Prohibited Modules**: Importing potentially dangerous modules such as `os`, `sys`, `subprocess`, `socket`, or `shutil` is strictly prohibited.
+
+    Args:
+    code_to_run (str): A string containing the Python code to be executed. Code block delimiters such as ```python or ``` do not need to be included.
+
+    Returns:
+    str: A string containing the execution result. It may contain standard output, the result of the last expression, errors, and/or Base64-encoded figures. Figures are clearly marked with `[FIGURE X - BASE64]:`.
+
+    ---
+    # Usage Examples
+
+    **1. Simple calculation:**
+    ```python
+    # code_to_run
+    "a = 50\nb = 12\nprint(f'The result of the multiplication is {a * b}')"
+    # Expected result: "The result of the multiplication is 600"
+    ```
+
+    **2. Analysis with the DataFrame `df`:**
+    ```python
+    # code_to_run
+    "print(f'The DataFrame has {len(df)} rows.')\ncolumn_means = df.select_dtypes(include=np.number).mean()\ncolumn_means"
+    # Returns the number of rows and then the mean of the numeric columns.
+    ```
+
+    **3. Generating a chart:**
+    ```python
+    # code_to_run
+    "import matplotlib.pyplot as plt\nimport seaborn as sns\nsns.histplot(data=df, x='column_name')\nplt.title('Column Distribution')\nplt.show()"
+    # Returns a Base64 image of the histogram.
+    ```
+    """
+    import textwrap
+    import builtins
+    import re
+    import json
+
+    if not isinstance(code_to_run, str):
+        return "Error: code must be a string."
+    code_to_run = textwrap.dedent(code_to_run).strip()
+    code_to_run = re.sub(r"^\s*```(?:python)?", "", code_to_run)
+    code_to_run = re.sub(r"```\s*$", "", code_to_run)
+
+    safe_code = json.dumps(code_to_run)  
+
+    client = docker.from_env()
+
+    try:
+        image_name = get_or_build_sandbox_image(client)
+    except docker.errors.APIError as e:
+        return f"Docker build error: {str(e)}"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            try:
+                script_content = f'''
+import sys
+import io
+import base64
+import pickle
+import json
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy
+from sklearn import *
+import builtins
+
+safe_packages = [
+    'numpy', 'pandas', 'matplotlib', 'seaborn', 'sklearn', 'scipy',
+    'math', 'random', 'json', 'datetime', 'collections', 'itertools',
+    'functools', 're', 'ast', 'io', 'base64', 'pickle', 'sys'
+]
+for pkg in safe_packages:
+    try:
+        __import__(pkg)
+    except ImportError:
+        pass
+
+plt.ioff()
+
+try:
+    with open('/app/dataframe.pkl', 'rb') as f:
+        df = pickle.load(f)
+except FileNotFoundError:
+    df = pd.DataFrame()
+
+stdout_capture = io.StringIO()
+sys.stdout = stdout_capture
+
+figures = []
+
+original_show = plt.show
+def custom_show(*args, **kwargs):
+    fig = plt.gcf()
+    if fig.get_axes():
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+        buf.seek(0)
+        figures.append(base64.b64encode(buf.getvalue()).decode('utf-8'))
+        buf.close()
+    plt.close(fig)
+
+plt.show = custom_show
+
+original_import = builtins.__import__
+blocked_modules = {{
+    'os', 'sys', 'subprocess', 'socket', 'shutil', 'pathlib',
+    'ctypes', 'importlib', 'multiprocessing'
+}}
+
+def restricted_import(name, *args, **kwargs):
+    base_name = name.split('.')[0]
+    if base_name in sys.modules or base_name not in blocked_modules:
+        return original_import(name, *args, **kwargs)
+    raise ImportError(f"Import of '{{name}}' is not allowed.")
+
+builtins.__import__ = restricted_import
+
+result = {{}}
+try:
+    user_namespace = {{'df': df}}
+    user_code = {safe_code}
+    exec(user_code, user_namespace)
+
+    if '_' in user_namespace and not figures:
+        result['output'] = user_namespace['_']
+
+    output = stdout_capture.getvalue()
+    if output:
+        result.setdefault('output', '')
+        result['output'] += output
+    if figures:
+        result['figures'] = figures
+
+except Exception as e:
+    result['error'] = str(e)
+    result['type'] = type(e).__name__
+
+finally:
+    sys.stdout = sys.__stdout__
+    print("EXECUTION_RESULT_START")
+    print(json.dumps(result))
+    print("EXECUTION_RESULT_END")
+'''
+                script_path = os.path.join(temp_dir, 'user_script.py')
+                with open(script_path, 'w', encoding='utf-8') as f:
+                    f.write(script_content)
+
+                df_path = os.path.join(temp_dir, 'dataframe.pkl')
+                with open(df_path, 'wb') as f:
+                    try:
+                        pickle.dump(DF, f)
+                    except NameError:
+                        pickle.dump(pd.DataFrame(), f)
+
+                container = client.containers.run(
+                    image=image_name,
+                    volumes={
+                        temp_dir: {'bind': '/app', 'mode': 'ro'},
+                        tmp_dir: {'bind': '/tmp', 'mode': 'rw'}
+                    },
+                    environment={'MPLCONFIGDIR': '/tmp', 'TMPDIR': '/tmp'},
+                    mem_limit='512m',
+                    network_disabled=True,
+                    read_only=True,
+                    security_opt=['no-new-privileges:true'],
+                    cap_drop=['ALL'],
+                    remove=True,
+                    stdout=True,
+                    stderr=True
+                )
+
+                output = container.decode('utf-8')
+
+                if "EXECUTION_RESULT_START" in output and "EXECUTION_RESULT_END" in output:
+                    start_idx = output.find("EXECUTION_RESULT_START") + len("EXECUTION_RESULT_START\n")
+                    end_idx = output.find("\nEXECUTION_RESULT_END")
+                    result_str = output[start_idx:end_idx].strip()
+
+                    try:
+                        result_dict = json.loads(result_str)
+                        final_result = ""
+                        if 'error' in result_dict:
+                            final_result = f"Error ({result_dict.get('type', 'Unknown')}): {result_dict['error']}"
+                        else:
+                            if 'output' in result_dict:
+                                final_result += str(result_dict['output'])
+                            if 'figures' in result_dict:
+                                for i, fig_b64 in enumerate(result_dict['figures']):
+                                    final_result += f"\n\n[FIGURE {i+1} - BASE64]:\n{fig_b64}"
+                        return final_result if final_result else "Code executed without output."
+                    except json.JSONDecodeError:
+                        return f"Error: Could not decode JSON from container. Raw output: {result_str}"
+                    except Exception as e:
+                        return f"Error processing result: {str(e)} Raw output: {output}"
+                else:
+                    return f"Error: Could not extract result from container. Output: {output}"
+
+            except docker.errors.ContainerError as e:
+                return f"Container error: {e.stderr.decode() if e.stderr else str(e)}"
+            except docker.errors.APIError as e:
+                return f"Docker API error: {str(e)}"
+            except Exception as e:
+                return f"An unexpected error occurred: {str(e)}"
+
+
+# //// MCP RESOURCES //// #
+@MCPserver.resource('supply-chain-server://table_schema')
+def get_data_structure():
+    table_schema = {
+  "table_schema": {
+    "table_name": "supply_chain_deliveries",
+    "description": """This table contains records of supply chain deliveries. 
+    Each row is a delivery register detailing the date, client, origin, type of delivery, number of pieces sold and total profit.""",
+    "columns": [
+      {
+        "name": "Year",
+        "type": "integer",
+        "description": "The year in which the delivery occurred.",
+        "example": 2020
+      },
+      {
+        "name": "Month",
+        "type": "string",
+        "description": "The month in which the delivery occurred.",
+        "example": "January"
+      },
+      {
+        "name": "Day",
+        "type": "integer",
+        "description": "The day of month in which the delivery occurred.",
+        "example": 7
+      },
+      {
+        "name": "Customer",
+        "type": "string",
+        "description": "Name of the client who received the delivery.",
+        "example": "Amazon"
+      },
+      {
+        "name": "Location",
+        "type": "string",
+        "description": "Distribution center location where the shipment originated.",
+        "example": "Sacramento"
+      },
+      {
+        "name": "BusinessType",
+        "type": "string",
+        "description": "Type of delivery, categorized as 'First Mile', 'Middle Mile', or 'Final Mile'.",
+        "example": "First Mile"
+      },
+      {
+        "name": "NumberOfPieces",
+        "type": "integer",
+        "description": "Number of pieces sold.",
+        "example": 3480
+      },
+      {
+        "name": "TotalRevenue",
+        "type": "float",
+        "description": "The profit generated by the delivery in USD.",
+        "example": 15691.09
+      }
+    ]
+  }
+}
+    return json.dumps(table_schema, indent=2)
+
+
+# //// MCP PROMPTS //// #
+@MCPserver.prompt(name='Data_analyst_system_prompt')
+def data_analyst_system_promtp(data_schema:str) -> str:
+    return f"""Eres un analista de datos senior en una empresa de cadena de suministro.
+
+Eres experto en Python y las librerías Pandas, Matplotlib, Seaborn, NumPy y Scikit-Learn.
+
+REGLAS ABSOLUTAS - NUNCA VIOLES ESTAS REGLAS:
+1. NUNCA crees DataFrames ficticios con pd.DataFrame() 
+2. NUNCA inventes datos usando listas, diccionarios o cualquier estructura de datos
+3. SIEMPRE usa ÚNICAMENTE el DataFrame 'df' que está PRE-CARGADO en el entorno
+4. El DataFrame 'df' contiene los datos REALES de la empresa - es lo ÚNICO que puedes usar
+
+IMPORTANTE: SIEMPRE debes usar la herramienta 'execute_python_code' para analizar datos reales antes de responder.
+
+## FLUJO OBLIGATORIO:
+1. **PRIMER PASO SIEMPRE**: Explorar el DataFrame 'df' real con df.head(), df.info(), df.shape
+2. **SEGUNDO PASO**: Usar ÚNICAMENTE los datos del DataFrame 'df' para cualquier análisis
+3. **TERCER PASO**: Basa tus respuestas ÚNICAMENTE en los resultados de la herramienta
+4. **Si no puedes obtener los datos del df real**, explica que no tienes acceso a la información
+
+PROHIBIDO ABSOLUTAMENTE:
+- Crear DataFrames con datos de ejemplo o sintéticos
+- Usar datos inventados o de ejemplo
+- Generar datos sintéticos o ficticios
+- Asumir estructura de datos sin verificar primero
+
+OBLIGATORIO:
+- Usar SOLO el DataFrame 'df' que está pre-cargado
+- Verificar la estructura real con df.columns, df.dtypes, df.shape
+- Basar TODO análisis en los datos REALES del DataFrame 'df'
+
+## MANEJO DE ERRORES - MUY IMPORTANTE:
+- Si tu código produce un error, **NO TE RINDAS**
+- **ANALIZA el error** y determina qué salió mal
+- **CORRIGE el código** basándote en el mensaje de error
+- **REINTENTA** hasta 3 veces antes de declarar que no puedes completar la tarea
+- Los errores comunes incluyen:
+  * Nombres de columnas incorrectos (verifica con df.columns)
+  * Tipos de datos incorrectos (usa df.dtypes)
+  * Filtros que no devuelven datos (verifica primero con df.shape)
+
+## ESTRATEGIA PARA TAREAS COMPLEJAS:
+Para tareas como pronósticos o análisis avanzados:
+1. **Primero explora** los datos disponibles
+2. **Divide la tarea** en pasos más pequeños
+3. **Valida cada paso** antes de continuar
+4. **Si algo falla**, debug paso por paso
+
+## EJEMPLO DE MANEJO DE ERRORES:
+Si obtienes un KeyError por una columna:
+```python
+# Primero verificar las columnas disponibles
+print("Columnas disponibles:", df.columns.tolist())
+# Luego ajustar el código según lo encontrado
+```
+
+## ESTRUCTURA DE LOS DATOS:
+{data_schema}
+
+## EJEMPLO DE EXPLORACIÓN INICIAL:
+Cuando te pidan un reporte, SIEMPRE comienza con:
+```python
+# Primero explorar los datos
+print("Explorando estructura de datos:")
+print(f"Shape del dataset: {{df.shape}}")
+print(f"Columnas: {{df.columns.tolist()}}")
+print(f"Tipos de datos: {{df.dtypes}}")
+print(f"Primeras 5 filas:")
+df.head()
+```
+
+RECUERDA: 
+- La PERSISTENCIA es clave para tareas complejas
+- SIEMPRE corrige errores y reintenta
+- Usa análisis paso a paso para tareas complejas  
+- NUNCA generes datos ficticios, solo usa el DataFrame 'df' pre-cargado
+- Si necesitas datos de ejemplo para pruebas, usa df.sample() del DataFrame real
+- PROHIBIDO crear nuevos DataFrames - solo usa el 'df' que ya existe"""
+
+
+# //// RUNNING SERVER //// #
+if __name__ == '__main__':
+    MCPserver.run()
